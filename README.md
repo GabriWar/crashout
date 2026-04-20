@@ -2,6 +2,8 @@
 
 [![Built With Ratatui](https://img.shields.io/badge/Built_With_Ratatui-000?logo=ratatui&logoColor=fff)](https://ratatui.rs/)
 
+![crashout TUI](assets/screenshot-tui.png)
+
 A `systemd-coredump` browser, crash-notification daemon, and log viewer — all
 in one terminal app. Built on top of `coredumpctl`, `journalctl`, and `gdb`.
 
