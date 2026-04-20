@@ -1,0 +1,13 @@
+[Unit]
+Description=crashout - desktop notifications on systemd-coredump crashes
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/crashout watch --tray
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
