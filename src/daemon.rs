@@ -1,74 +1,63 @@
 use anyhow::{Context, Result};
 use notify_rust::{Notification, Urgency};
-use serde::Deserialize;
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use systemd::journal::{Journal, JournalFiles, JournalSeek, JournalWaitResult};
 
 /// systemd-coredump journal MESSAGE_ID.
 const COREDUMP_MESSAGE_ID: &str = "fc2e22bc6ee647b6b90729ab34a250b1";
 
-#[derive(Debug, Deserialize)]
 struct Entry {
-    #[serde(rename = "COREDUMP_EXE")]
     exe: Option<String>,
-    #[serde(rename = "COREDUMP_CMDLINE")]
     cmdline: Option<String>,
-    #[serde(rename = "COREDUMP_PID")]
     pid: Option<String>,
-    #[serde(rename = "COREDUMP_SIGNAL_NAME")]
     signal_name: Option<String>,
-    #[serde(rename = "COREDUMP_SIGNAL")]
     signal: Option<String>,
-    #[serde(rename = "COREDUMP_UNIT")]
     unit: Option<String>,
 }
 
-pub fn run(notify_enabled: Arc<AtomicBool>) -> Result<()> {
-    let mut child = Command::new("journalctl")
-        .args([
-            "-f",
-            "-o",
-            "json",
-            "--output-fields=COREDUMP_EXE,COREDUMP_CMDLINE,COREDUMP_PID,COREDUMP_SIGNAL,COREDUMP_SIGNAL_NAME,COREDUMP_UNIT",
-            "-n",
-            "0",
-            &format!("MESSAGE_ID={COREDUMP_MESSAGE_ID}"),
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to spawn journalctl")?;
+impl Entry {
+    fn from_record(r: &BTreeMap<String, String>) -> Self {
+        Self {
+            exe: r.get("COREDUMP_EXE").cloned(),
+            cmdline: r.get("COREDUMP_CMDLINE").cloned(),
+            pid: r.get("COREDUMP_PID").cloned(),
+            signal_name: r.get("COREDUMP_SIGNAL_NAME").cloned(),
+            signal: r.get("COREDUMP_SIGNAL").cloned(),
+            unit: r.get("COREDUMP_UNIT").cloned(),
+        }
+    }
+}
 
-    let stdout = child
-        .stdout
-        .take()
-        .context("journalctl has no stdout")?;
-    let reader = BufReader::new(stdout);
+pub fn run(notify_enabled: Arc<AtomicBool>) -> Result<()> {
+    let mut journal = Journal::open(JournalFiles::All, false, false)
+        .context("open journal")?;
+    journal
+        .match_add("MESSAGE_ID", COREDUMP_MESSAGE_ID)
+        .context("add match")?;
+    // Position past the tail so only *new* entries fire.
+    journal.seek(JournalSeek::Tail).context("seek tail")?;
 
     eprintln!(
         "crashout: watching for coredumps (notify={})",
         if notify_enabled.load(Ordering::Relaxed) { "on" } else { "off" }
     );
 
-    for line in reader.lines() {
-        let line = line.context("reading journalctl stdout")?;
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Entry>(&line) {
-            Ok(entry) => {
-                log_crash(&entry);
-                if notify_enabled.load(Ordering::Relaxed) {
-                    notify(&entry);
-                }
+    loop {
+        while let Some(record) = journal.next_entry().context("next entry")? {
+            let entry = Entry::from_record(&record);
+            log_crash(&entry);
+            if notify_enabled.load(Ordering::Relaxed) {
+                notify(&entry);
             }
-            Err(e) => eprintln!("crashout: parse error: {e}"),
         }
+        // Block up to 10 minutes — then loop to let thread react to signals.
+        let _: JournalWaitResult = journal
+            .wait(Some(Duration::from_secs(600)))
+            .context("journal wait")?;
     }
-
-    let status = child.wait()?;
-    anyhow::bail!("journalctl exited: {status}");
 }
 
 fn log_crash(e: &Entry) {
