@@ -1,6 +1,7 @@
 use crate::coredump::{self, Age, Dump};
 use crate::logs_browser::LogsBrowser;
 use crate::logview;
+use crate::procs_screen::ProcsScreen;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -147,6 +148,7 @@ enum Mode {
 enum Screen {
     Crashes,
     Logs,
+    Procs,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -185,6 +187,7 @@ struct App {
     screen: Screen,
     crash_view: CrashView,
     logs_browser: Option<LogsBrowser>,
+    procs_screen: Option<ProcsScreen>,
 }
 
 impl App {
@@ -215,6 +218,7 @@ impl App {
             screen: Screen::Crashes,
             crash_view: CrashView::List,
             logs_browser: None,
+            procs_screen: None,
         };
         app.seen_pids = app.all.iter().map(|d| d.pid).collect();
         app.rebuild_view();
@@ -226,6 +230,11 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.poll_background();
+            if self.screen == Screen::Procs {
+                if let Some(p) = self.procs_screen.as_mut() {
+                    p.tick();
+                }
+            }
             terminal.draw(|f| self.draw(f))?;
 
             if self.last_poll.elapsed() >= Duration::from_secs(2) && self.screen == Screen::Crashes {
@@ -255,6 +264,13 @@ impl App {
             let text_input_active =
                 self.mode == Mode::Filter || (self.screen == Screen::Logs && logs_filtering);
 
+            let procs_filtering = self
+                .procs_screen
+                .as_ref()
+                .map(|p| p.is_filtering())
+                .unwrap_or(false);
+            let text_input_active = text_input_active || (self.screen == Screen::Procs && procs_filtering);
+
             if !text_input_active {
                 match key.code {
                     KeyCode::Char('1') => {
@@ -266,6 +282,13 @@ impl App {
                             self.logs_browser = Some(LogsBrowser::new());
                         }
                         self.screen = Screen::Logs;
+                        continue;
+                    }
+                    KeyCode::Char('3') => {
+                        if self.procs_screen.is_none() {
+                            self.procs_screen = Some(ProcsScreen::new());
+                        }
+                        self.screen = Screen::Procs;
                         continue;
                     }
                     KeyCode::Char('?') => {
@@ -315,6 +338,13 @@ impl App {
                         .unwrap_or(crate::logs_browser::LBAction::None);
                     if let crate::logs_browser::LBAction::Edit(path) = action {
                         self.spawn_editor(&path, terminal);
+                    }
+                }
+                Screen::Procs => {
+                    if let Some(p) = self.procs_screen.as_mut() {
+                        if p.handle_key(key.code, key.modifiers) {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -885,6 +915,13 @@ impl App {
                 }
                 self.draw_logs_status(f, chunks[3]);
             }
+            Screen::Procs => {
+                self.draw_procs_filter_bar(f, chunks[1]);
+                if let Some(p) = self.procs_screen.as_mut() {
+                    p.draw(f, chunks[2]);
+                }
+                self.draw_procs_status(f, chunks[3]);
+            }
         }
 
         if self.mode == Mode::Help {
@@ -908,6 +945,11 @@ impl App {
             Span::styled(
                 " 2:logs ",
                 if self.screen == Screen::Logs { active } else { inactive },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                " 3:procs ",
+                if self.screen == Screen::Procs { active } else { inactive },
             ),
             Span::raw("  "),
         ];
@@ -957,18 +999,77 @@ impl App {
                     spans.push(Span::raw("loading..."));
                 }
             }
+            Screen::Procs => {
+                if let Some(p) = &self.procs_screen {
+                    spans.push(Span::styled(
+                        p.status.clone(),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                    spans.push(Span::raw("   s:sort  K:term  9:kill  y:yank  r:reload"));
+                } else {
+                    spans.push(Span::raw("loading..."));
+                }
+            }
         }
 
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_logs_filter_bar(&self, f: &mut Frame, area: Rect) {
-        let text = match self.logs_browser.as_ref() {
-            Some(b) if b.is_filtering() => format!("/{}_", b.filter_text()),
-            Some(b) if !b.filter_text().is_empty() => format!("/{}", b.filter_text()),
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(b) = self.logs_browser.as_ref() {
+            if let Some(prompt) = b.date_prompt() {
+                spans.push(Span::styled(prompt, Style::default().fg(Color::Magenta)));
+            } else {
+                let filter_text = if b.is_filtering() {
+                    format!("/{}_", b.filter_text())
+                } else if !b.filter_text().is_empty() {
+                    format!("/{}", b.filter_text())
+                } else {
+                    String::new()
+                };
+                spans.push(Span::styled(filter_text, Style::default().fg(Color::Yellow)));
+                let summary = b.date_summary();
+                if !summary.is_empty() {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(summary, Style::default().fg(Color::Magenta)));
+                }
+                let bufs = b.buffer_labels();
+                if !bufs.is_empty() {
+                    spans.push(Span::raw("  "));
+                    for (i, label) in bufs.iter().enumerate() {
+                        spans.push(Span::styled(
+                            format!(" {}:{} ", i + 1, label),
+                            Style::default().fg(Color::Black).bg(Color::Cyan),
+                        ));
+                        spans.push(Span::raw(" "));
+                    }
+                }
+            }
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn draw_procs_filter_bar(&self, f: &mut Frame, area: Rect) {
+        let text = match self.procs_screen.as_ref() {
+            Some(p) if p.is_filtering() => format!("/{}_", p.filter_text()),
+            Some(p) if !p.filter_text().is_empty() => format!("/{}", p.filter_text()),
             _ => String::new(),
         };
         let line = Line::from(vec![Span::styled(text, Style::default().fg(Color::Yellow))]);
+        f.render_widget(Paragraph::new(line), area);
+    }
+
+    fn draw_procs_status(&self, f: &mut Frame, area: Rect) {
+        let msg = self
+            .procs_screen
+            .as_ref()
+            .map(|p| p.status.clone())
+            .unwrap_or_default();
+        let line = Line::from(vec![Span::styled(
+            format!(" {} ", msg),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        )]);
         f.render_widget(Paragraph::new(line), area);
     }
 
@@ -1135,7 +1236,7 @@ impl App {
         f.render_widget(Clear, rect);
         let help_lines = vec![
             "-- global --",
-            "1 / 2        switch screen: crashes / logs",
+            "1 / 2 / 3    switch screen: crashes / logs / procs",
             "? / Esc      this help / close help (any key)",
             "q            quit",
             "",
@@ -1162,6 +1263,20 @@ impl App {
             "esc          fullscreen \u{2192} browser (top level = quit)",
             "/            filter sources",
             "r / R        rescan all / refresh preview",
+            "b / d        open buffer / close buffer",
+            "Alt+1..9     switch open log buffer",
+            "F / T        set --since / --until (journal sources)",
+            "",
+            "-- procs screen --",
+            "j/k g/G      navigate (list) or scroll (detail)",
+            "tab / S-tab  cycle: status/maps/fds/limits/environ/stream",
+            "enter        list \u{2192} detail \u{2022} on stream tab: toggle strace",
+            "esc          detail \u{2192} list (kills strace) \u{2022} top = quit",
+            "/            filter by name/pid",
+            "s            cycle sort: cpu/mem/pid/name",
+            "K / 9        SIGTERM / SIGKILL the selected pid",
+            "y            yank pid",
+            "r            manual reload (auto every 2s on this screen)",
         ];
         let text: Vec<Line> = help_lines.into_iter().map(Line::from).collect();
         let para = Paragraph::new(text)

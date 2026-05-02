@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/crashout watch --tray
+ExecStart=%h/.cargo/bin/crashout --tray
 Restart=on-failure
 RestartSec=5
 

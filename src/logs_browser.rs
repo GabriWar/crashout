@@ -81,15 +81,30 @@ impl Source {
         }
     }
 
-    fn fetch_preview(&self) -> String {
+    fn fetch_preview(&self, since: &str, until: &str) -> String {
         match self {
             Source::File { path, .. } => tail_file(path),
-            Source::Unit(u) => journal_unit(u, false),
-            Source::UserUnit(u) => journal_unit(u, true),
-            Source::Kernel => journal_args(&["-k", "-n", &PREVIEW_LINES.to_string(), "-o", "short-iso", "--no-pager"]),
-            Source::All => journal_args(&["-n", &PREVIEW_LINES.to_string(), "-o", "short-iso", "--no-pager"]),
+            Source::Unit(u) => journal_unit(u, false, since, until),
+            Source::UserUnit(u) => journal_unit(u, true, since, until),
+            Source::Kernel => {
+                let mut args: Vec<String> = vec!["-k".into(), "-n".into(), PREVIEW_LINES.to_string(), "-o".into(), "short-iso".into(), "--no-pager".into()];
+                push_date(&mut args, since, until);
+                journal_args_str(&args)
+            }
+            Source::All => {
+                let mut args: Vec<String> = vec!["-n".into(), PREVIEW_LINES.to_string(), "-o".into(), "short-iso".into(), "--no-pager".into()];
+                push_date(&mut args, since, until);
+                journal_args_str(&args)
+            }
         }
     }
+
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateField {
+    Since,
+    Until,
 }
 
 pub struct LogsBrowser {
@@ -105,6 +120,16 @@ pub struct LogsBrowser {
 
     mode: LBMode,
     fs_list_state: ListState,
+
+    // Pinned source indices reachable via Alt+1..9 (SEE-style buffers).
+    buffers: Vec<usize>,
+
+    // Date range applied to journal-backed previews (raw strings passed to
+    // `journalctl --since/--until`). Files ignore them.
+    since: String,
+    until: String,
+    editing_date: Option<DateField>,
+    date_buf: String,
 }
 
 impl LogsBrowser {
@@ -123,6 +148,11 @@ impl LogsBrowser {
             status: String::new(),
             mode: LBMode::Browser,
             fs_list_state: ListState::default(),
+            buffers: Vec::new(),
+            since: String::new(),
+            until: String::new(),
+            editing_date: None,
+            date_buf: String::new(),
         };
         b.apply_filter();
         b.status = format!("{} log sources", b.sources.len());
@@ -131,7 +161,40 @@ impl LogsBrowser {
     }
 
     pub fn is_filtering(&self) -> bool {
-        self.filtering
+        self.filtering || self.editing_date.is_some()
+    }
+
+    pub fn date_prompt(&self) -> Option<String> {
+        self.editing_date.map(|f| match f {
+            DateField::Since => format!("--since: {}_", self.date_buf),
+            DateField::Until => format!("--until: {}_", self.date_buf),
+        })
+    }
+
+    pub fn buffer_labels(&self) -> Vec<String> {
+        self.buffers
+            .iter()
+            .filter_map(|&i| self.sources.get(i))
+            .map(|s| {
+                let t = s.match_text();
+                let short = t.rsplit('/').next().unwrap_or(&t);
+                let mut s = short.to_owned();
+                if s.len() > 14 {
+                    s.truncate(13);
+                    s.push('\u{2026}');
+                }
+                s
+            })
+            .collect()
+    }
+
+    pub fn date_summary(&self) -> String {
+        match (self.since.as_str(), self.until.as_str()) {
+            ("", "") => String::new(),
+            (s, "") => format!("since:{s}"),
+            ("", u) => format!("until:{u}"),
+            (s, u) => format!("since:{s} until:{u}"),
+        }
     }
 
     pub fn status(&self) -> &str {
@@ -154,6 +217,34 @@ impl LogsBrowser {
         if kind != KeyEventKind::Press {
             return LBAction::None;
         }
+        if let Some(field) = self.editing_date {
+            match code {
+                KeyCode::Esc => {
+                    self.editing_date = None;
+                    self.date_buf.clear();
+                }
+                KeyCode::Enter => {
+                    let v = self.date_buf.trim().to_owned();
+                    match field {
+                        DateField::Since => self.since = v,
+                        DateField::Until => self.until = v,
+                    }
+                    self.editing_date = None;
+                    self.date_buf.clear();
+                    self.preview_of = None;
+                    self.ensure_preview();
+                    self.status = format!("range \u{2192} {}", self.date_summary());
+                }
+                KeyCode::Backspace => {
+                    self.date_buf.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.date_buf.push(c);
+                }
+                _ => {}
+            }
+            return LBAction::None;
+        }
         if self.filtering {
             match code {
                 KeyCode::Esc | KeyCode::Enter => {
@@ -173,9 +264,61 @@ impl LogsBrowser {
             }
             return LBAction::None;
         }
+        // Alt+1..9 → jump to pinned buffer (any mode).
+        if mods.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(c) = code {
+                if let Some(d) = c.to_digit(10) {
+                    if (1..=9).contains(&d) {
+                        self.activate_buffer((d - 1) as usize);
+                        return LBAction::None;
+                    }
+                }
+            }
+        }
         match self.mode {
             LBMode::Browser => self.handle_browser_key(code, mods),
             LBMode::Fullscreen => self.handle_fullscreen_key(code, mods),
+        }
+    }
+
+    fn activate_buffer(&mut self, n: usize) {
+        let Some(&src_idx) = self.buffers.get(n) else {
+            self.status = format!("buffer {} not set", n + 1);
+            return;
+        };
+        let Some(vis_pos) = self.visible.iter().position(|&i| i == src_idx) else {
+            self.status = format!("buffer {} hidden by current filter", n + 1);
+            return;
+        };
+        self.list_state.select(Some(vis_pos));
+        self.preview_scroll = 0;
+        self.ensure_preview();
+        self.status = format!("buf {} \u{2192} {}", n + 1, self.sources[src_idx].match_text());
+    }
+
+    fn pin_current(&mut self) {
+        let Some(vis_idx) = self.list_state.selected() else { return };
+        let Some(&src_idx) = self.visible.get(vis_idx) else { return };
+        if let Some(pos) = self.buffers.iter().position(|&i| i == src_idx) {
+            self.status = format!("already pinned as buf {}", pos + 1);
+            return;
+        }
+        if self.buffers.len() >= 9 {
+            self.status = "buffer slots full (1..9)".into();
+            return;
+        }
+        self.buffers.push(src_idx);
+        self.status = format!("pinned as buf {}", self.buffers.len());
+    }
+
+    fn unpin_current(&mut self) {
+        let Some(vis_idx) = self.list_state.selected() else { return };
+        let Some(&src_idx) = self.visible.get(vis_idx) else { return };
+        if let Some(pos) = self.buffers.iter().position(|&i| i == src_idx) {
+            self.buffers.remove(pos);
+            self.status = "unpinned".into();
+        } else {
+            self.status = "not pinned".into();
         }
     }
 
@@ -192,6 +335,16 @@ impl LogsBrowser {
                 self.preview_scroll = self.preview_scroll.saturating_sub(10);
             }
             KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Char('b') => self.pin_current(),
+            KeyCode::Char('d') => self.unpin_current(),
+            KeyCode::Char('F') => {
+                self.editing_date = Some(DateField::Since);
+                self.date_buf = self.since.clone();
+            }
+            KeyCode::Char('T') => {
+                self.editing_date = Some(DateField::Until);
+                self.date_buf = self.until.clone();
+            }
             KeyCode::Char('r') => {
                 self.status = "rescanning...".into();
                 let mut sources = discover();
@@ -318,7 +471,7 @@ impl LogsBrowser {
         let Some(src) = self.sources.get(src_idx) else {
             return;
         };
-        let text = src.fetch_preview();
+        let text = src.fetch_preview(&self.since, &self.until);
         self.preview = logview::colorize(&text);
         self.preview_of = Some(src_idx);
     }
@@ -619,7 +772,7 @@ fn tail_file(path: &Path) -> String {
     }
 }
 
-fn journal_unit(unit: &str, user: bool) -> String {
+fn journal_unit(unit: &str, user: bool, since: &str, until: &str) -> String {
     let mut cmd = Command::new("journalctl");
     if user {
         cmd.arg("--user");
@@ -633,6 +786,12 @@ fn journal_unit(unit: &str, user: bool) -> String {
         "short-iso",
         "--no-pager",
     ]);
+    if !since.is_empty() {
+        cmd.arg("--since").arg(since);
+    }
+    if !until.is_empty() {
+        cmd.arg("--until").arg(until);
+    }
     match cmd.output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(e) => format!("journalctl spawn failed: {e}"),
@@ -643,6 +802,24 @@ fn journal_args(args: &[&str]) -> String {
     match Command::new("journalctl").args(args).output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(e) => format!("journalctl spawn failed: {e}"),
+    }
+}
+
+fn journal_args_str(args: &[String]) -> String {
+    match Command::new("journalctl").args(args).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => format!("journalctl spawn failed: {e}"),
+    }
+}
+
+fn push_date(args: &mut Vec<String>, since: &str, until: &str) {
+    if !since.is_empty() {
+        args.push("--since".into());
+        args.push(since.to_owned());
+    }
+    if !until.is_empty() {
+        args.push("--until".into());
+        args.push(until.to_owned());
     }
 }
 
